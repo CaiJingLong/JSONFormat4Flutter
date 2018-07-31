@@ -7,18 +7,20 @@
 import json
 from PyQt5.QtWidgets import QLabel, QComboBox, QMessageBox
 
-# 验证json字符串是否合法
 from template_code import get_top_code_dict, get_list_code_loop
 
 msg_box_ui = None
 
 
+# 验证json字符串是否合法
 def is_json(myjson):
     try:
-        json.loads(myjson)
+        j = json.loads(myjson)
     except ValueError:
         return False
-    return True
+    if type(j) in (list, dict):
+        return True
+    return False
 
 
 # 传入未格式化的单行json字符串，返回指定缩进的多行json字符串
@@ -75,7 +77,10 @@ def build_list_construction(f, t, n):
         code = list_code_loop(code, i, total, n, class_type)
 
     # 嵌套模板的后续处理
-    code = code.replace('%s%s' % (n, 'Child' * total), 'new %s(%s%s)' % (class_type, n, ('Item' * total)))
+    if check_level_type(class_type) not in (1, 2) and class_type != '':
+        code = code.replace('%s%s' % (n, 'Child' * total), 'new %s.fromJson(%s%s)' % (class_type, n, ('Item' * total)))
+    else:
+        code = code.replace('%s' % ('Child' * total), '%s' % ('Item' * total))
     code = code[code.find(';') + 1:]
     code = code.replace('%s){' % n, 'jsonRes[\'%s\']){' % n).replace('${loop}', '')
 
@@ -87,11 +92,15 @@ def add_param_to_code(code, param):
 
     # 先按照基本数据类型方式处理
     properties = '  %s %s;\n' % (t, n)
+    this_properties = 'this.%s, ' % n
     construction = '    %s = jsonRes[\'%s\'];\n' % (n, f)
     toString = '"%s": $%s,' % (f, n)
 
     pp = code.find('${properties}')
     code = code[:pp] + properties + code[pp:]
+
+    ptp = code.find('${this.properties}')
+    code = code[:ptp] + this_properties + code[ptp:]
 
     pc = code.find('${construction}')
     code = code[:pc] + construction + code[pc:]
@@ -108,7 +117,7 @@ def add_param_to_code(code, param):
 
     # dict类型处理，只需要修改construction中的输出方式
     elif tcode == 4:
-        code = code.replace('jsonRes[\'%s\']' % f, 'new %s(jsonRes[\'%s\'])' % (t, f))
+        code = code.replace('jsonRes[\'%s\']' % f, 'new %s.fromJson(jsonRes[\'%s\'])' % (t, f))
 
     # list类型处理，只需要修改construction中的输出方式
     elif tcode == 3:
@@ -140,10 +149,10 @@ def build_level_code(level_bean):
                     child_bean.append(level_bean.pop(0))
                 build_level_code(child_bean)
             # 数据类型为数组时
-            if check_level_type(t) == 3:
+            if check_level_type(t) == 3 and len(level_bean) > 0:
                 generic_type = level_bean[0][2].replace('List<', '').replace('>', '')
                 # 如果List的里层数据为dict则对其去壳后处理
-                if check_level_type(generic_type) == 4:
+                if check_level_type(generic_type) == 4 and generic_type != '':
                     while check_level_type(level_bean[0][2]) == 3:
                         work_level = level_bean[0][0]
                         level_bean.pop(0)
@@ -155,7 +164,7 @@ def build_level_code(level_bean):
 
             # 不管如何，到这里的数据都是目前dict的一级子数据，作为参数传入模板中
             code = add_param_to_code(code, (f, t, n))
-        codes.append(code.replace(',${toString}', '').replace('${construction}', '').replace('${properties}', ''))
+        codes.append(code.replace(',${toString}', '').replace('${construction}', '').replace('${properties}', '').replace('${this.properties}', ''))
 
 
 def generate_code(work_bean):
@@ -183,9 +192,40 @@ def generate_code(work_bean):
     if is_list_top:
         res = res.replace('jsonRes[\'list\']', 'jsonRes', 1)
 
-    # 最终修改，添加jsonStr解析为jsonRes代码
-    bp = res.find('(jsonRes) {')
-    return 'import \'dart:convert\' show json;\n' + res[:bp] + '(jsonStr) {\n  var jsonRes = json.decode(jsonStr);\n' + res[bp + 11:]
+    # 如果json中存在空list这种操蛋情况，将list类型从list<>修改成list<dynamic>
+    res = res.replace('List<>', 'List<dynamic>')
+
+    # 移除参数构造函数用模板生成后多余的逗号和空格
+    res = res.replace(', });', '});')
+
+    # 移除没有必要的list取值循环，这次循环只是修改list声明代码，并将不需要的行加上注释
+    # 下面一次的循环则忽略这些注释的行达到删除的效果
+    lines = res.splitlines()
+    for index in range(len(lines)):
+        if r'.add(' in lines[index]:
+            sp = lines[index].find(r'.add(')
+            ep = lines[index].rfind(r')')
+            if r'(' not in lines[index][sp + 5:ep]:
+                sp = lines[index - 2].find('in ')
+                ep = lines[index - 2].rfind(')')
+                list_src = lines[index - 2][sp + 3:ep]
+                lines[index - 4] = lines[index - 4].replace('[]', list_src)
+                for i in range(6):
+                    lines[index - 3 + i] = '//%s' % lines[index - 3 + i]
+
+    # 最终修改，添加json库导包代码，并为顶层对象增加默认构造
+    out_res = 'import \'dart:convert\' show json;\n'
+    first = True
+    for line in lines:
+        if line.startswith('//'):
+            continue
+        out_res += (line + '\n')
+        if first and r'.fromParams({this.' in line:
+            class_name = line.split(r'.fromParams({this.')[0].strip()
+            out_res += '\n  factory %s(jsonStr) => jsonStr is String ? %s.fromJson(json.decode(jsonStr)) : %s.fromJson(jsonStr);\n' \
+                       % (class_name, class_name, class_name)
+            first = False
+    return out_res
 
 
 def check_and_generate_code(bean):
