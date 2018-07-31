@@ -6,3 +6,5 @@
 Test/.dart_tool
 Test/.idea
 Test/.packages
+
+.vscode
